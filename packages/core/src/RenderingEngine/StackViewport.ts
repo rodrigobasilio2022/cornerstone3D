@@ -174,6 +174,8 @@ class StackViewport extends Viewport {
   private initialInvert = false;
   private initialTransferFunctionNodes = null;
   private interpolationType: InterpolationType;
+  // List of modalities that should use per-image VOI behavior
+  private perImageVOIModalities: string[] = ['XA', 'DR', 'CR'];
 
   // Helpers
   private _imageData: vtkImageDataType;
@@ -675,6 +677,7 @@ class StackViewport extends Viewport {
    @param properties.VOILUTFunction - Function to handle the application of a lookup table (LUT) to the VOI.
    @param properties.invert - A boolean value to toggle color inversion (true: inverted, false: not inverted).
    @param properties.interpolationType - Determines the interpolation method to be used (1: linear, 0: nearest-neighbor).
+   @param properties.perImageVOIModalities - Array of modality strings (e.g., ['XA', 'DR', 'CR']) that should use per-image VOI behavior instead of global VOI.
    @param properties.rotation - Specifies the image rotation angle in degrees.
    @param suppressEvents - A boolean value to control event suppression. If true, the related events will not be triggered. Default is false.
    */
@@ -685,6 +688,7 @@ class StackViewport extends Viewport {
       VOILUTFunction,
       invert,
       interpolationType,
+      perImageVOIModalities,
     }: StackViewportProperties = {},
     suppressEvents = false
   ): void {
@@ -702,7 +706,13 @@ class StackViewport extends Viewport {
       invert: this.globalDefaultProperties.invert ?? invert,
       interpolationType:
         this.globalDefaultProperties.interpolationType ?? interpolationType,
+      perImageVOIModalities:
+        this.globalDefaultProperties.perImageVOIModalities ?? perImageVOIModalities,
     };
+
+    if (typeof perImageVOIModalities !== 'undefined') {
+      this.perImageVOIModalities = perImageVOIModalities;
+    }
 
     if (typeof colormap !== 'undefined') {
       this.setColormap(colormap);
@@ -760,6 +770,7 @@ class StackViewport extends Viewport {
       interpolationType,
       invert,
       voiUpdatedWithSetProperties,
+      perImageVOIModalities,
     } = this;
 
     return {
@@ -769,6 +780,7 @@ class StackViewport extends Viewport {
       interpolationType,
       invert,
       isComputedVOI: !voiUpdatedWithSetProperties,
+      perImageVOIModalities,
     };
   };
 
@@ -882,7 +894,24 @@ class StackViewport extends Viewport {
 
   private _getVOIFromCache(): VOIRange {
     let voiRange;
-    if (this.voiUpdatedWithSetProperties) {
+
+    // Check if current modality should use per-image VOI behavior
+    // These modalities typically have different window/level per image in the series
+    const shouldUsePerImageVOI = this.perImageVOIModalities.includes(this.modality);
+
+    if (shouldUsePerImageVOI) {
+      // First, check if user has manually adjusted VOI for this specific image
+      const currentImageId = this.getCurrentImageId();
+      const perImageProps = this.perImageIdDefaultProperties.get(currentImageId);
+
+      if (perImageProps?.voiRange) {
+        // Use the user-adjusted VOI for this specific image
+        voiRange = perImageProps.voiRange;
+      } else {
+        // Use the VOI from metadata for this image
+        voiRange = this._getVOIRangeForCurrentImage() ?? this.voiRange;
+      }
+    } else if (this.voiUpdatedWithSetProperties) {
       // use the cached voiRange if the voiRange is locked (if the user has
       // manually set the voi with tools or setProperties api)
       voiRange = this.voiRange;
@@ -1299,6 +1328,27 @@ class StackViewport extends Viewport {
     }
   }
 
+  /**
+   * Stores per-image VOI for modalities configured to use per-image VOI behavior.
+   * This allows each image to remember user-adjusted window/level values.
+   * @param voiRange - The VOI range to store
+   */
+  private _storePerImageVOI(voiRange: VOIRange): void {
+    // For configured modalities: store per-image VOI when user manually adjusts it
+    // This allows each image to maintain its own window/level while remembering user changes
+    const shouldUsePerImageVOI = this.perImageVOIModalities.includes(this.modality);
+    if (shouldUsePerImageVOI && !this.stackInvalidated) {
+      const currentImageId = this.getCurrentImageId();
+      if (currentImageId) {
+        const existingProps = this.perImageIdDefaultProperties.get(currentImageId) || {};
+        this.perImageIdDefaultProperties.set(currentImageId, {
+          ...existingProps,
+          voiRange: voiRange,
+        });
+      }
+    }
+  }
+
   private setVOICPU(voiRange: VOIRange, options: SetVOIOptions = {}): void {
     const { suppressEvents = false } = options;
     // TODO: Account for VOILUTFunction
@@ -1345,6 +1395,10 @@ class StackViewport extends Viewport {
     }
 
     this.voiRange = voiRange;
+
+    // Store per-image VOI if applicable
+    this._storePerImageVOI(voiRange);
+
     const eventDetail: VoiModifiedEventDetail = {
       viewportId: this.id,
       range: voiRange,
@@ -1446,6 +1500,9 @@ class StackViewport extends Viewport {
     if (!this.voiUpdatedWithSetProperties) {
       this.voiUpdatedWithSetProperties = voiUpdatedWithSetProperties;
     }
+
+    // Store per-image VOI if applicable
+    this._storePerImageVOI(voiRangeToUse);
 
     if (suppressEvents) {
       return;
